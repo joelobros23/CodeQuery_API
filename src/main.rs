@@ -1,102 +1,121 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, Error};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use flate2::read::GzDecoder;
+use tar::Archive;
 use std::path::Path;
 use ignore::WalkBuilder;
-use std::collections::HashMap;
+use std::fs;
+use std::io::Read;
 
-#[derive(Debug, Deserialize)]
-struct CodeQueryRequest {
-    repository_url: String,
+#[derive(Deserialize)]
+struct SearchQuery {
+    repo_url: String,
+    query: String,
 }
 
-#[derive(Debug, Serialize)]
-struct CodeAnalysisResponse {
-    total_lines: usize,
-    keyword_counts: HashMap<String, usize>,
-    // Add more analysis data here
+#[derive(Serialize)]
+struct SearchResult {
+    file_path: String,
+    line_number: usize,
+    line: String,
 }
 
-async fn analyze_code(req: web::Json<CodeQueryRequest>) -> Result<HttpResponse, Error> {
-    let repo_url = &req.repository_url;
+async fn search(query: web::Json<SearchQuery>) -> Result<HttpResponse, Error> {
+    println!("Received search request: repo_url={}, query={}", query.repo_url, query.query);
 
-    // Basic implementation - replace with actual cloning/fetching
-    // and proper error handling
-    let temp_dir = std::env::temp_dir().join("codequery_temp");
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir).map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
-    }
+    let repo_url = &query.repo_url;
+    let search_query = &query.query;
 
-    std::fs::create_dir_all(&temp_dir).map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+    // 1. Download the repository as a tar.gz archive.
+    let archive_path = "repo.tar.gz";
+    match download_repo(repo_url, archive_path).await {
+        Ok(_) => println!("Repository downloaded successfully."),
+        Err(e) => {
+            eprintln!("Error downloading repository: {}", e);
+            return Ok(HttpResponse::InternalServerError().body(format!("Failed to download repository: {}", e)));
+        }
+    };
 
-    // Placeholder: Assume files are already in temp_dir
-    // In reality, clone the git repository to temp_dir
-    // Example using reqwest (needs error handling, proper git clone lib):
-    // let output = Command::new("git").arg("clone").arg(repo_url).arg(&temp_dir).output().expect("Failed to execute git clone");
-    // if !output.status.success() {
-    //     eprintln!("Error cloning repository: {:?}", String::from_utf8_lossy(&output.stderr));
-    //     return Err(actix_web::error::ErrorInternalServerError("Failed to clone repository"));
-    // }
+    // 2. Extract the archive to a temporary directory.
+    let extract_path = "temp_repo";
+    match extract_archive(archive_path, extract_path) {
+        Ok(_) => println!("Repository extracted successfully."),
+        Err(e) => {
+            eprintln!("Error extracting repository: {}", e);
+            return Ok(HttpResponse::InternalServerError().body(format!("Failed to extract repository: {}", e)));
+        }
+    };
 
-    let analysis_result = perform_code_analysis(&temp_dir).map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+    // 3. Search for the query within the extracted files.
+    let search_results = match search_files(extract_path, search_query) {
+        Ok(results) => results,
+        Err(e) => {
+            eprintln!("Error searching files: {}", e);
+            return Ok(HttpResponse::InternalServerError().body(format!("Failed to search files: {}", e)));
+        }
+    };
 
-    std::fs::remove_dir_all(&temp_dir).map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+    // 4. Clean up the temporary directory and archive.
+    fs::remove_dir_all(extract_path).unwrap_or_else(|e| eprintln!("Failed to remove temp dir: {}", e));
+    fs::remove_file(archive_path).unwrap_or_else(|e| eprintln!("Failed to remove archive: {}", e));
 
-    Ok(HttpResponse::Ok().json(analysis_result))
+    // 5. Return the search results.
+    Ok(HttpResponse::Ok().json(search_results))
 }
 
-fn perform_code_analysis(repo_path: &Path) -> Result<CodeAnalysisResponse, std::io::Error> {
-    let mut total_lines = 0;
-    let mut keyword_counts: HashMap<String, usize> = HashMap::new();
-    let keywords = vec!["fn", "let", "if", "else", "for", "while", "return", "struct", "enum", "impl"];
+async fn download_repo(repo_url: &str, archive_path: &str) -> Result<(), reqwest::Error> {
+    let response = reqwest::get(repo_url).await?;
+    let mut file = File::create(archive_path).expect("Failed to create archive file");
+    let mut content =  std::io::Cursor::new(response.bytes().await?);
+    std::io::copy(&mut content, &mut file).expect("Failed to copy content to file");
+    Ok(())
+}
 
-    let walker = WalkBuilder::new(repo_path).build();
+fn extract_archive(archive_path: &str, extract_path: &str) -> Result<(), std::io::Error> {
+    let file = File::open(archive_path)?; 
+    let gz = GzDecoder::new(file);
+    let mut archive = Archive::new(gz);
+    archive.unpack(extract_path)?; 
+    Ok(())
+}
 
-    for result in walker {
+fn search_files(root_path: &str, query: &str) -> Result<Vec<SearchResult>, std::io::Error> {
+    let mut results: Vec<SearchResult> = Vec::new();
+
+    for result in WalkBuilder::new(root_path).build() {
         match result {
             Ok(entry) => {
-                if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    if let Some(ext) = entry.path().extension() {
-                        if ext == "rs" || ext == "py" || ext == "js" || ext == "java" || ext == "go" {
+                let path = entry.path();
 
-                            let file = File::open(entry.path())?;
-                            let reader = BufReader::new(file);
-
-                            for line_result in reader.lines() {
-                                let line = line_result?;
-                                total_lines += 1;
-
-                                for keyword in &keywords {
-                                    if line.contains(keyword) {
-                                        *keyword_counts.entry(keyword.to_string()).or_insert(0) += 1;
-                                    }
+                if path.is_file() {
+                    if let Some(file_path) = path.to_str() {
+                        if let Ok(file_content) = fs::read_to_string(path) {
+                            for (line_number, line) in file_content.lines().enumerate() {
+                                if line.contains(query) {
+                                    results.push(SearchResult {
+                                        file_path: file_path.to_string(),
+                                        line_number: line_number + 1,
+                                        line: line.to_string(),
+                                    });
                                 }
                             }
                         }
                     }
                 }
             }
-            Err(err) => println!("Error: {}", err),
+            Err(err) => println!("ERROR: {}", err),
         }
     }
 
-    Ok(CodeAnalysisResponse {
-        total_lines,
-        keyword_counts,
-    })
+    Ok(results)
 }
 
-async fn health_check() -> impl Responder {
-    HttpResponse::Ok().body("Service is healthy")
-}
-
-#[tokio::main]
+#[actix_web::main]
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
-            .route("/health", web::get().to(health_check))
-            .route("/analyze", web::post().to(analyze_code))
+            .route("/api/search", web::post().to(search))
     })
     .bind("127.0.0.1:8080")?
     .run()
