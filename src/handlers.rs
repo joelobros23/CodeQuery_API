@@ -1,98 +1,65 @@
 use actix_web::{web, HttpResponse, Responder, Error};
 use serde::{Deserialize, Serialize};
 use reqwest;
-use std::fs::File;
-use flate2::read::GzDecoder;
-use tar::Archive;
-use ignore::gitignore::GitignoreBuilder;
-use ignore::WalkBuilder;
 
-#[derive(Deserialize)]
-pub struct QueryRequest {
+#[derive(Debug, Deserialize)]
+pub struct AnalyzeRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnalyzeResponse {
+    pub analysis_results: String, // Replace with actual analysis results structure
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchRequest {
     pub query: String,
-    pub repo_url: String,
 }
 
-#[derive(Serialize)]
-pub struct QueryResponse {
-    pub results: Vec<String>,
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub search_results: String, // Replace with actual search results structure
 }
 
-async fn download_and_extract_repo(repo_url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let response = reqwest::get(repo_url).await?;
-    let content = response.bytes().await?;
-
-    let gz_decoder = GzDecoder::new(&content[..]);
-    let mut archive = Archive::new(gz_decoder);
-
-    let extract_path = format!("./tmp/{}", chrono::Utc::now().timestamp_nanos());
-    std::fs::create_dir_all(&extract_path)?; // Ensure the directory exists
-
-    archive.unpack(&extract_path)?;  // Unpack into the created directory
-
-    Ok(extract_path)
+// Placeholder implementation for code analysis
+async fn perform_code_analysis(code: String) -> Result<String, reqwest::Error> {
+    // Replace this with actual code analysis logic.  For now, just return a placeholder.
+    Ok(format!("Analysis results for code: {}\n(This is a placeholder)", code))
 }
 
-async fn search_code(query: &str, repo_path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut results = Vec::new();
-
-    let mut ignore_builder = GitignoreBuilder::new(repo_path);
-    if ignore_builder.add(".gitignore").is_err() {
-        println!("Warning: Could not read .gitignore");
-    }
-    let ignore = ignore_builder.build()?;
-
-    let walker = WalkBuilder::new(repo_path)
-        .hidden(false) // Don't ignore hidden files
-        .git_ignore(false) // Use our custom ignore
-        .build();
-
-    for result in walker {
-        let entry = result?;
-        if entry.file_type().map_or(false, |ft| ft.is_file()) {
-            if ignore.matched(entry.path(), false).is_ignore() {
-                continue;
-            }
-
-            let file_content = std::fs::read_to_string(entry.path())?;
-            if file_content.contains(query) {
-                results.push(entry.path().display().to_string());
-            }
-        }
-    }
-
-    Ok(results)
+// Placeholder implementation for code search
+async fn perform_code_search(query: String) -> Result<String, reqwest::Error> {
+    // Replace this with actual code search logic. For now, just return a placeholder.
+    Ok(format!("Search results for query: {}\n(This is a placeholder)", query))
 }
 
-pub async fn handle_query(req: web::Json<QueryRequest>) -> Result<impl Responder, Error> {
-    println!("Received query: {}", &req.query);
-    println!("Received repo_url: {}", &req.repo_url);
+pub async fn analyze_code(req: web::Json<AnalyzeRequest>) -> Result<HttpResponse, Error> {
+    let code = req.code.clone();
+    let analysis_results = perform_code_analysis(code).await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
-    let repo_path_result = download_and_extract_repo(&req.repo_url).await;
+    let response = AnalyzeResponse {
+        analysis_results: analysis_results,
+    };
 
-    match repo_path_result {
-        Ok(repo_path) => {
-            let search_results_result = search_code(&req.query, &repo_path).await;
+    Ok(HttpResponse::Ok().json(response))
+}
 
-            match search_results_result {
-                Ok(search_results) => {
-                    // Clean up the temporary directory
-                    if let Err(e) = std::fs::remove_dir_all(&repo_path) {
-                        eprintln!("Error cleaning up temporary directory: {}", e);
-                    }
-                    Ok(HttpResponse::Ok().json(QueryResponse { results: search_results }))
-                }
-                Err(e) => {
-                     // Clean up the temporary directory even if search fails
-                    if let Err(cleanup_err) = std::fs::remove_dir_all(&repo_path) {
-                        eprintln!("Error cleaning up temporary directory: {}", cleanup_err);
-                    }
-                    Err(actix_web::error::ErrorInternalServerError(format!("Search failed: {}", e)))
-                }
-            }
-        }
-        Err(e) => {
-            Err(actix_web::error::ErrorBadRequest(format!("Download and extract failed: {}", e)))
-        }
-    }
+pub async fn search_code(req: web::Json<SearchRequest>) -> Result<HttpResponse, Error> {
+    let query = req.query.clone();
+    let search_results = perform_code_search(query).await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+
+    let response = SearchResponse {
+        search_results: search_results,
+    };
+
+    Ok(HttpResponse::Ok().json(response))
+}
+
+
+// Example of a simple health check endpoint
+pub async fn health_check() -> impl Responder {
+    HttpResponse::Ok().body("Service is healthy!")
 }
